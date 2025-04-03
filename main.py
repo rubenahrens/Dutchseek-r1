@@ -1,7 +1,3 @@
-"""
-Fout: dictionary update sequence element #0 has length 6; 2 is required
-"""
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -32,9 +28,14 @@ if not torch.cuda.is_available():
 device = "cuda"
 
 # Model en tokenizer initialiseren voor DeepSeek
-model_name = "deepseek-ai/deepseek-coder-1.3b-base"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+model_name = "google/gemma-3-4b-it"
+# Lees token vanuit bestand `token.txt`
+with open("token.txt", "r") as f:
+    access_token = f.read().strip()
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, token=access_token)
+
+model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, token=access_token).to(device)
 
 # Lokale vertaalmodellen initialiseren
 nl_to_en_tokenizer = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-nl-en")
@@ -58,38 +59,65 @@ class ChatRequest(BaseModel):
 
 async def generate_streaming_response(message: str) -> AsyncGenerator[str, None]:
     try:
-        # Nederlandse input naar Engels vertalen met lokaal model
-        translated_input = translate_nl_to_en(message)
+        # Voor debuggen
+        print(f"Originele input: {message}")
         
-        # Model input voorbereiden
-        inputs = tokenizer(translated_input, return_tensors="pt").to(device)
+        # Bericht formatteren volgens Gemma's verwachte structuur
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "Je bent een behulpzame assistent die duidelijke, informatieve antwoorden geeft."}]
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": message}]
+            }
+        ]
         
-        # Streamer initialiseren
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        # Laat de berichtstructuur zien voor debugging
+        print(f"Berichtstructuur: {json.dumps(messages, indent=2)}")
         
-        # Generatie in een aparte thread starten
-        generation_kwargs = dict(
-            inputs["input_ids"],
-            max_length=200,
-            num_return_sequences=1,
-            temperature=0.7,
-            pad_token_id=tokenizer.eos_token_id,
-            streamer=streamer
+        # Laat tokenizer de juiste chat template toepassen
+        input_text = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False,
+            add_generation_prompt=True
         )
         
-        # Start generatie in een aparte thread
+        print(f"Toegepast chat template: {input_text}")
+        
+        # Model input voorbereiden
+        inputs = tokenizer(input_text, return_tensors="pt", padding=True).to(device)
+        
+        # Rest van je code blijft hetzelfde
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        
+        generation_kwargs = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "max_length": 200,
+            "num_return_sequences": 1,
+            "do_sample": True,
+            "temperature": 0.7,
+            "pad_token_id": tokenizer.eos_token_id,
+            "streamer": streamer
+        }
+        
         thread = Thread(target=model.generate, kwargs=generation_kwargs)
         thread.start()
         
-        # Stream de tokens
+        accumulated_text = ""
+        
         for text in streamer:
+            accumulated_text += text
             yield f"data: {json.dumps({'text': text})}\n\n"
-        
-        # Vertaal het volledige antwoord naar Nederlands
-        translated_response = translate_en_to_nl(text)
-        yield f"data: {json.dumps({'text': translated_response, 'done': True})}\n\n"
-        
+            
+        yield f"data: {json.dumps({'text': accumulated_text, 'done': True})}\n\n"
+            
     except Exception as e:
+        print(f"Fout: {str(e)}")
+        import traceback
+        traceback.print_exc()
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 @app.get("/")
@@ -102,6 +130,29 @@ async def chat(request: ChatRequest):
         generate_streaming_response(request.message),
         media_type="text/event-stream"
     )
+
+@app.post("/test_input")
+async def test_input(request: ChatRequest):
+    message = request.message
+    
+    # Bereid een chat voor met het juiste Gemma-formaat
+    messages = [
+        {"role": "user", "content": message}
+    ]
+    
+    # Gebruik het ingebouwde chat template van de tokenizer
+    chat_formatted = tokenizer.apply_chat_template(messages, tokenize=False)
+    
+    # Tokenize de chat-geformatteerde tekst
+    tokenized = tokenizer(chat_formatted, return_tensors="pt", padding=True)
+    
+    result = {
+        "original_message": message,
+        "chat_formatted": chat_formatted,
+        "token_count": len(tokenized["input_ids"][0]),
+        "tokens": tokenizer.convert_ids_to_tokens(tokenized["input_ids"][0])
+    }
+    return result
 
 if __name__ == "__main__":
     uvicorn.run(app, host="localhost", port=8000)
